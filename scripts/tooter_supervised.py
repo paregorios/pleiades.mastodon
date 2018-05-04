@@ -15,7 +15,9 @@ from pleiades.walker.walker import PleiadesWalker
 from pprint import pformat
 from os.path import abspath, join, realpath
 import random
+import shutil
 import sys
+from textwrap import TextWrapper
 from time import sleep
 
 DEFAULT_LOG_LEVEL = logging.WARNING
@@ -39,7 +41,12 @@ POSITIONAL_ARGUMENTS = [
 ]
 MASTODON_MAX_RATE = 1.1   # 300 requests in 5 minutes == 1 request per second
 MASTODON_MIN_RATE = 0.13
-
+MASTODON_MAX_CHARS = 500
+wrapper = TextWrapper(
+    width=70, initial_indent='     > ', subsequent_indent='     > ')
+answer_wrapper = TextWrapper(
+    width=70, initial_indent='     > ', subsequent_indent='     > ',
+    replace_whitespace=False)
 logger = logging.getLogger(__name__)
 
 
@@ -106,9 +113,12 @@ class Tooter:
         self._amsg(
             'The bot is listening. It knows about {} #PleiadesGazetteer '
             'places'.format(self.place_count))
-        with open(join('data', 'since_id.txt'), 'r') as f:
+        since_path = join('data', 'since_id.txt')
+        bak_path = join('data', 'since_id.txt.bak')
+        with open(since_path, 'r') as f:
             since_id = f.read().strip()
         del f
+        shutil.copy(since_path, bak_path)
         while True:
             period = random.uniform(self.min_period, self.max_period)
             logger.debug('sleeping for {} seconds'.format(period))
@@ -125,10 +135,10 @@ class Tooter:
                     f.write(str(since_id))
                 del f
 
-    def _amsg(self, msg, mute=False):
+    def _amsg(self, msg, mute=False, in_reply_to_id=None):
         print(msg)
         if not mute and not self.silent and self.api is not None:
-            self.api.toot(msg)
+            self.api.status_post(msg, in_reply_to_id=in_reply_to_id)
 
     def _handle_notification(self, n: dict):
         logger.debug(
@@ -163,23 +173,64 @@ class Tooter:
 
     def _handle_mention(self, d: dict):
         logger.info('got a mention!')
+        who = '@{}'.format(d['account']['acct'])
         soup = BeautifulSoup(d['status']['content'], 'html.parser')
         content = soup.get_text()
         words = content.split()
         content = ' '.join([w for w in words if not w.startswith('@')])
         answer = self.brain.answer(content)
-        formatted_answer = '{}\n\n'.format(
-            d['account']['acct']) + '\n'.join(answer)
-        print('\nMention from {}:'.format(
+        print(''.ljust(80, '='))
+        print('Mention from {}:'.format(
             self._serialize('user', d['account'])))
-        print('\t"{}"'.format(content))
+        print('\n'.join(wrapper.wrap(content)))
         print('My brain thinks a good answer would be:')
-        print(formatted_answer)
+        prefix = ''
+        if len(answer) > 1:
+            prefix = (
+                'I know about {} places relevant to your query.\n\n'
+                ''.format(len(answer)))
+
+        chunks = []
+        if (len(prefix) + len(who) + len('  '.join(answer)) +
+                len(answer)*6) > MASTODON_MAX_CHARS:
+            if len(answer) == 1:
+                raise NotImplementedError(
+                    'Single formatted answer is too long.')
+            else:
+                for a in answer:
+                    fa = '{}\n\n'.format(who) + a
+                    if len(a) > MASTODON_MAX_CHARS - 10:
+                        raise NotImplementedError(
+                            'One of the formatted answers is too long: "'
+                            '{}"'.format(a))
+                    chunks.append(fa)
+                for i, chunk in enumerate(chunks):
+                    postfix = ''
+                    if len(chunks) > 1:
+                        postfix = ' {}/{}'.format(i, len(chunks))
+                        chunk = '{}{}'.format(chunk, postfix)
+                if prefix != '':
+                    chunks = [prefix] + chunks
+        else:
+            chunks = ['{}\n\n{}'.format(who, '\n\n'.join(answer))]
+        if len(chunks) > 1:
+            print(
+                'NB: This answer will be returned in {} chunks'.format(
+                    len(chunks)))
+            for chunk in chunks:
+                print('     > '.ljust(80, '-'))
+                print('\n'.join(answer_wrapper.wrap(chunk)))
+        else:
+            print('\n'.join(answer_wrapper.wrap(chunks[0])))
         verdict = input('Should I post the answer? [y/n]: ')
         if not verdict or verdict.lower() != 'y':
             pass
         else:
-            self._amsg(formatted_answer)
+            for chunk in chunks:
+                self._amsg(chunk, in_reply_to_id=d['id'])
+                period = random.uniform(self.min_period, self.min_period * 3.0)
+                sleep(period)
+
 
 def main(**kwargs):
     """
