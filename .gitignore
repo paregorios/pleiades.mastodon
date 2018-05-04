@@ -4,7 +4,8 @@
 .LSOverride
 
 # Icon must end with two \r
-Icon
+Icon
+
 
 # Thumbnails
 ._*
@@ -129,3 +130,10 @@ venv.bak/
 # mypy
 .mypy_cache/
 *.bak
+
+data/creds.json
+
+data/since_id.txt
+scripts/template3.py
+tests/test_template3.py
+pleiades/mastodon/package_template_3.py
