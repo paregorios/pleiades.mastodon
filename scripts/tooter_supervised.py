@@ -10,6 +10,7 @@ import getpass
 import json
 import logging
 from mastodon import Mastodon
+from mastodon.Mastodon import MastodonNotFoundError, MastodonUnauthorizedError
 from pleiades.mastodon.brain import Brain
 from pleiades.walker.walker import PleiadesWalker
 from pprint import pformat
@@ -42,12 +43,16 @@ POSITIONAL_ARGUMENTS = [
 MASTODON_MAX_RATE = 1.1   # 300 requests in 5 minutes == 1 request per second
 MASTODON_MIN_RATE = 0.13
 MASTODON_MAX_CHARS = 500
+BLOCK_QUOTE_LEADER = '     > '
 wrapper = TextWrapper(
-    width=70, initial_indent='     > ', subsequent_indent='     > ')
+    width=70, initial_indent=BLOCK_QUOTE_LEADER,
+    subsequent_indent=BLOCK_QUOTE_LEADER)
 answer_wrapper = TextWrapper(
-    width=70, initial_indent='     > ', subsequent_indent='     > ',
+    width=70, initial_indent=BLOCK_QUOTE_LEADER,
+    subsequent_indent=BLOCK_QUOTE_LEADER,
     replace_whitespace=False)
 logger = logging.getLogger(__name__)
+MAX_ANSWER_COUNT = 5
 
 
 class Tooter:
@@ -94,7 +99,7 @@ class Tooter:
                 email, creds['api_base_url']))
         try:
             access_token = api.log_in(email, pwd, scopes=['read', 'write'])
-        except Mastodon.MastodonUnauthorizedError:
+        except MastodonUnauthorizedError:
             logger.critical('Login failed: bad credentials.')
             sys.exit(-1)
         del email
@@ -138,7 +143,16 @@ class Tooter:
     def _amsg(self, msg, mute=False, in_reply_to_id=None):
         print(msg)
         if not mute and not self.silent and self.api is not None:
-            self.api.status_post(msg, in_reply_to_id=in_reply_to_id)
+            try:
+                self.api.status_post(msg, in_reply_to_id=in_reply_to_id)
+            except MastodonNotFoundError as e:
+                logger.critical(
+                    ('\n'.join(
+                        (
+                            ':'.join([str(a) for a in e.args]),
+                            'msg: "{}"'.format(msg),
+                            'in_reply_to_id: "{}"'.format(in_reply_to_id)
+                        ))))
 
     def _handle_notification(self, n: dict):
         logger.debug(
@@ -171,63 +185,95 @@ class Tooter:
                         e, pformat(d, indent=4)))
                 sys.exit(-1)
 
-    def _handle_mention(self, d: dict):
-        logger.info('got a mention!')
-        who = '@{}'.format(d['account']['acct'])
-        soup = BeautifulSoup(d['status']['content'], 'html.parser')
-        content = soup.get_text()
-        words = content.split()
-        content = ' '.join([w for w in words if not w.startswith('@')])
-        answer = self.brain.answer(content)
-        print(''.ljust(80, '='))
-        print('Mention from {}:'.format(
-            self._serialize('user', d['account'])))
-        print('\n'.join(wrapper.wrap(content)))
-        print('My brain thinks a good answer would be:')
-        prefix = ''
-        if len(answer) > 1:
-            prefix = (
-                'I know about {} places relevant to your query.\n\n'
-                ''.format(len(answer)))
-
-        chunks = []
-        if (len(prefix) + len(who) + len('  '.join(answer)) +
-                len(answer)*6) > MASTODON_MAX_CHARS:
-            if len(answer) == 1:
-                raise NotImplementedError(
-                    'Single formatted answer is too long.')
+    def _print_block_quote(self, value):
+        logger.debug('value: "{}"'.format(value))
+        if isinstance(value, str):
+            content = value
+        elif isinstance(value, list) or isinstance(value, tuple):
+            content = '\n'.join(value)
+        else:
+            raise TypeError(
+                '{} cannot work with argument of type {}'
+                ''.format('_print_block_instance', type(value)))
+        lines = []
+        for line in answer_wrapper.wrap(content):
+            logger.debug('line: "{}"'.format(line))
+            if not line.startswith(BLOCK_QUOTE_LEADER):
+                lines.append('{}{}'.format(BLOCK_QUOTE_LEADER, line))
             else:
-                for a in answer:
-                    fa = '{}\n\n'.format(who) + a
-                    if len(a) > MASTODON_MAX_CHARS - 10:
-                        raise NotImplementedError(
-                            'One of the formatted answers is too long: "'
-                            '{}"'.format(a))
-                    chunks.append(fa)
-                for i, chunk in enumerate(chunks):
-                    postfix = ''
-                    if len(chunks) > 1:
-                        postfix = ' {}/{}'.format(i, len(chunks))
-                        chunk = '{}{}'.format(chunk, postfix)
-                if prefix != '':
-                    chunks = [prefix] + chunks
+                lines.append(line)
+        logger.debug('lines: "{}"'.format(lines))
+        print('\n'.join(lines))
+
+    def _cook_answer(self, raw, querent):
+        maximum = MASTODON_MAX_CHARS - 12  # room for multi-part
+        words = raw.split()
+        word_count = len(words)
+        while True:
+            reply = '{}\n\n{}'.format(querent, ' '.join(words))
+            if len(reply) <= maximum:
+                break
+            words = words[0:-1]
+        if len(words) < word_count:
+            reply += ' ...'
+        return reply
+
+    def _handle_mention(self, d: dict):
+        querent = '@{}'.format(d['account']['acct'])
+        query_id = d['id']
+        logger.info(
+            'got a mention from {} with id="{}"'.format(
+                querent, query_id))
+        soup = BeautifulSoup(d['status']['content'], 'html.parser')
+        query = soup.get_text()
+        words = query.split()
+        query_content = ' '.join([w for w in words if not w.startswith('@')])
+        raw_answers = self.brain.answer(query_content)
+        cooked_answers = [
+            self._cook_answer(a, querent) for a in raw_answers]
+        final_answers = '\n\n'.join(cooked_answers)
+        if len(final_answers) < MASTODON_MAX_CHARS:
+            final_answers = [final_answers]
+        elif len(cooked_answers) == 1:
+            raise RuntimeError('this should never happen')
         else:
-            chunks = ['{}\n\n{}'.format(who, '\n\n'.join(answer))]
-        if len(chunks) > 1:
-            print(
-                'NB: This answer will be returned in {} chunks'.format(
-                    len(chunks)))
-            for chunk in chunks:
-                print('     > '.ljust(80, '-'))
-                print('\n'.join(answer_wrapper.wrap(chunk)))
-        else:
-            print('\n'.join(answer_wrapper.wrap(chunks[0])))
+            answer_count = len(cooked_answers)
+            if answer_count > MAX_ANSWER_COUNT:
+                final_answers = [self._cook_answer(
+                    'I have found {} place resources relevant to your query. '
+                    'In order to avoid opprobrium, I am only allowed to '
+                    'return the first {} answers. I will provide information '
+                    'about each of those place resources in subsequent '
+                    'replies.'.format(
+                        answer_count, MAX_ANSWER_COUNT), querent)]
+            else:
+                final_answers = [self._cook_answer(
+                    'I have found {} place resources relevant to your query. '
+                    'I will provide information about each of them in '
+                    'subsequent replies.'.format(answer_count), querent)]
+            for i, answer in enumerate(cooked_answers):
+                if i >= MAX_ANSWER_COUNT:
+                    break
+                final_answers.append(
+                    '{} {}/{}'.format(
+                        answer, i+1, min(answer_count, MAX_ANSWER_COUNT)))
+
+        print(''.ljust(80, '='))
+        print('Mention from {} with id="{}":\n'.format(
+            self._serialize('user', d['account']), query_id))
+        self._print_block_quote(query_content)
+        print('\nMy brain thinks a good answer would be:')
+        for answer in final_answers:
+            print('')
+            self._print_block_quote(answer)
+        print('')
         verdict = input('Should I post the answer? [y/n]: ')
         if not verdict or verdict.lower() != 'y':
             pass
         else:
-            for chunk in chunks:
-                self._amsg(chunk, in_reply_to_id=d['id'])
+            for answer in final_answers:
+                print('')
+                self._amsg(answer, in_reply_to_id=d['id'])
                 period = random.uniform(self.min_period, self.min_period * 3.0)
                 sleep(period)
 
