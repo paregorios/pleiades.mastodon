@@ -44,15 +44,16 @@ MASTODON_MAX_RATE = 1.1   # 300 requests in 5 minutes == 1 request per second
 MASTODON_MIN_RATE = 0.13
 MASTODON_MAX_CHARS = 500
 BLOCK_QUOTE_LEADER = '     > '
+BLOCK_QUOTE_WIDTH = 80
 wrapper = TextWrapper(
-    width=70, initial_indent=BLOCK_QUOTE_LEADER,
+    width=BLOCK_QUOTE_WIDTH, initial_indent=BLOCK_QUOTE_LEADER,
     subsequent_indent=BLOCK_QUOTE_LEADER)
 answer_wrapper = TextWrapper(
-    width=70, initial_indent=BLOCK_QUOTE_LEADER,
+    width=BLOCK_QUOTE_WIDTH, initial_indent=BLOCK_QUOTE_LEADER,
     subsequent_indent=BLOCK_QUOTE_LEADER,
     replace_whitespace=False)
-logger = logging.getLogger(__name__)
 MAX_ANSWER_COUNT = 5
+logger = logging.getLogger(__name__)
 
 
 class Tooter:
@@ -146,11 +147,13 @@ class Tooter:
             try:
                 self.api.status_post(msg, in_reply_to_id=in_reply_to_id)
             except MastodonNotFoundError as e:
-                logger.critical(
+                self.api.status_post(msg)
+                logger.warning(
                     ('\n'.join(
                         (
-                            ':'.join([str(a) for a in e.args]),
-                            'msg: "{}"'.format(msg),
+                            'message posted without reply_to id because '
+                            'instance responded with "{}"'
+                            ''.format(':'.join([str(a) for a in e.args])),
                             'in_reply_to_id: "{}"'.format(in_reply_to_id)
                         ))))
 
@@ -195,28 +198,75 @@ class Tooter:
             raise TypeError(
                 '{} cannot work with argument of type {}'
                 ''.format('_print_block_instance', type(value)))
-        lines = []
-        for line in answer_wrapper.wrap(content):
-            logger.debug('line: "{}"'.format(line))
-            if not line.startswith(BLOCK_QUOTE_LEADER):
-                lines.append('{}{}'.format(BLOCK_QUOTE_LEADER, line))
-            else:
-                lines.append(line)
-        logger.debug('lines: "{}"'.format(lines))
-        print('\n'.join(lines))
+        raw_chunks = content.split('\n\n')
+        cooked_chunks = []
+        for raw_chunk in raw_chunks:
+            raw_lines = raw_chunk.split('\n')
+            cooked_lines = []
+            for raw_line in raw_lines:
+                if len(raw_line) > BLOCK_QUOTE_WIDTH:
+                    cooked_lines.extend(answer_wrapper.wrap(raw_line))
+                else:
+                    cooked_lines.append(raw_line)
+            cooked_chunks.append(cooked_lines)
+        served_lines = []
+        for chunk in cooked_chunks:
+            for line in chunk:
+                if line.startswith(BLOCK_QUOTE_LEADER):
+                    served_lines.append(line)
+                else:
+                    served_lines.append(
+                        '{}{}'.format(
+                            BLOCK_QUOTE_LEADER, line))
+            served_lines.append(BLOCK_QUOTE_LEADER)
+        served_lines = served_lines[:-1]  # trim off trailing block quote moj
+        logger.debug('served_lines: "{}"'.format(served_lines))
+        print('\n'.join(served_lines))
 
     def _cook_answer(self, raw, querent):
         maximum = MASTODON_MAX_CHARS - 12  # room for multi-part
-        words = raw.split()
-        word_count = len(words)
+        reply = '{}\n\n{}'.format(querent, raw)
+        if len(reply) <= maximum:
+            logger.debug('raw answer is sufficiently short')
+            return reply
+        logger.warning(
+            'Raw answer exceeds maximum {} characters. Attempting to '
+            'truncate...'.format(maximum))
+        reduce_by = len(reply) - maximum
+        chunks = [(i, c, len(c)) for i, c in enumerate(raw.split('\n\n'))]
+        chunks.sort(key=lambda tup: tup[2])
+        chunk_i, chunk, chunk_len = chunks[-1]
+        logger.debug('The longest chunk is "{}"'.format(chunk))
+        lines = [(i, l, len(l)) for i, l in enumerate(chunk.split('\n'))]
+        lines.sort(key=lambda tup: tup[2])
+        line_i, line, line_len = lines[-1]
+        logger.debug('The longest line is "{}"'.format(line))
+        if line_len <= reduce_by:
+            raise RuntimeError('the answer will be eliminated')
+        goal = line_len - reduce_by
+        words = line.split()
         while True:
-            reply = '{}\n\n{}'.format(querent, ' '.join(words))
-            if len(reply) <= maximum:
+            words = words[:-1]
+            line = ' '.join(words)
+            if len(line) <= goal - 3:  # leave room for ellipsis
+                if line.endswith('...'):
+                    pass
+                elif line.endswith('.'):
+                    line += '..'
+                else:
+                    line += '...'
                 break
-            words = words[0:-1]
-        if len(words) < word_count:
-            reply += ' ...'
-        return reply
+        logger.debug('The line has been truncated by {} characters to "{}"')
+        lines[-1] = (line_i, line, len(line))
+        lines.sort(key=lambda tup: tup[0])
+        chunk = '\n'.join([line for line_i, line, line_len in lines])
+        chunks[-1] = (chunk_i, chunk, len(chunk))
+        chunks.sort(key=lambda tup: tup[0])
+        cooked = '\n\n'.join([chunk for chunk_i, chunk, chunk_len in chunks])
+        logger.debug('The cooked answer is: "{}"'.format(cooked))
+        reply = '{}\n\n{}'.format(querent, cooked)
+        logger.debug('The cooked reply is "{}"'.format(reply))
+        return cooked
 
     def _handle_mention(self, d: dict):
         querent = '@{}'.format(d['account']['acct'])
